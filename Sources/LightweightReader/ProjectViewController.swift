@@ -2,6 +2,15 @@ import AppKit
 import PDFKit
 import UniformTypeIdentifiers
 
+private struct LoadedPDF: @unchecked Sendable {
+    let document: PDFDocument
+}
+
+private struct LoadedMarkdown: Sendable {
+    let text: String
+    let hash: String
+}
+
 @MainActor
 private final class DocumentDropView: NSView {
     var onFileDrop: ((URL) -> Void)?
@@ -77,6 +86,7 @@ final class ProjectViewController: NSViewController {
     private let openButton = NSButton(title: String(localized: "file.open"), target: nil, action: nil)
     private let saveButton = NSButton(title: String(localized: "file.save"), target: nil, action: nil)
     private let titleLabel = NSTextField(labelWithString: String(localized: "app.title"))
+    private let loadingIndicator = NSProgressIndicator()
     private let content = NSView()
     private let bar = NSStackView()
     private var barHeight: NSLayoutConstraint?
@@ -98,10 +108,13 @@ final class ProjectViewController: NSViewController {
         openButton.target = self; openButton.action = #selector(openDocument)
         saveButton.target = self; saveButton.action = #selector(saveDocument)
         saveButton.isEnabled = false
+        loadingIndicator.style = .spinning
+        loadingIndicator.controlSize = .small
+        loadingIndicator.isDisplayedWhenStopped = false
         titleLabel.font = .preferredFont(forTextStyle: .headline)
         titleLabel.lineBreakMode = .byTruncatingMiddle
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        bar.addArrangedSubview(openButton); bar.addArrangedSubview(saveButton); bar.addArrangedSubview(titleLabel)
+        bar.addArrangedSubview(openButton); bar.addArrangedSubview(saveButton); bar.addArrangedSubview(loadingIndicator); bar.addArrangedSubview(titleLabel)
         container.addSubview(bar)
         content.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(content)
@@ -145,23 +158,64 @@ final class ProjectViewController: NSViewController {
     }
     func open(_ url: URL) {
         loadTask?.cancel()
+        barHeight?.constant = 52
+        bar.isHidden = false
+        loadingIndicator.startAnimation(nil)
         loadTask = Task { [weak self] in
             guard let self else { return false }
+            defer {
+                if !Task.isCancelled {
+                    self.loadingIndicator.stopAnimation(nil)
+                    if self.current == nil {
+                        self.barHeight?.constant = 0
+                        self.bar.isHidden = true
+                    }
+                }
+            }
             do {
                 let type = try ReaderType(url: url)
                 switch type {
                 case .pdf:
-                    guard let document = PDFDocument(url: url) else { throw ReaderError.invalidEncoding }
+                    let loading = Task.detached(priority: .userInitiated) { () throws -> LoadedPDF in
+                        try Task.checkCancellation()
+                        guard let document = PDFDocument(url: url) else { throw ReaderError.invalidEncoding }
+                        try Task.checkCancellation()
+                        return LoadedPDF(document: document)
+                    }
+                    let result = try await withTaskCancellationHandler {
+                        try await loading.value
+                    } onCancel: {
+                        loading.cancel()
+                    }
                     guard !Task.isCancelled else { return false }
-                    self.install(PDFViewController(document: document), url: url)
+                    self.install(PDFViewController(document: result.document), url: url)
                 case .markdown:
-                    let text = try await Task.detached { try MarkdownStore().read(url) }.value
+                    let loading = Task.detached(priority: .userInitiated) { () throws -> LoadedMarkdown in
+                        try Task.checkCancellation()
+                        let store = MarkdownStore()
+                        let text = try store.read(url)
+                        try Task.checkCancellation()
+                        return LoadedMarkdown(text: text, hash: store.hash(text))
+                    }
+                    let result = try await withTaskCancellationHandler {
+                        try await loading.value
+                    } onCancel: {
+                        loading.cancel()
+                    }
                     guard !Task.isCancelled else { return false }
-                    let reader = MarkdownViewController(url: url, text: text)
+                    let reader = MarkdownViewController(url: url, text: result.text, savedHash: result.hash)
                     reader.onDirtyChange = { [weak self] dirty in self?.saveButton.isEnabled = dirty; self?.updateTitle() }
                     self.install(reader, url: url)
                 case .json:
-                    let index = try await Task.detached { try JSONIndex(url: url) }.value
+                    let loading = Task.detached(priority: .userInitiated) {
+                        try Task.checkCancellation()
+                        return try JSONIndex(url: url)
+                    }
+                    let index = try await withTaskCancellationHandler {
+                        try await loading.value
+                    } onCancel: {
+                        loading.cancel()
+                    }
                     guard !Task.isCancelled else { return false }
                     self.install(JSONViewController(index: index), url: url)
                 }
@@ -179,6 +233,7 @@ final class ProjectViewController: NSViewController {
     private func install(_ controller: NSViewController, url: URL) {
         barHeight?.constant = 52
         bar.isHidden = false
+        (current as? MarkdownViewController)?.cancelPreview()
         current?.view.removeFromSuperview()
         current?.removeFromParent()
         content.subviews.forEach { $0.removeFromSuperview() }

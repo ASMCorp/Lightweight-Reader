@@ -86,54 +86,57 @@ final class JSONIndex: @unchecked Sendable {
 
     func page(for parent: JSONEntry, number: Int) throws -> JSONPage {
         guard parent.type != .scalar, number >= 0, number <= Int.max / pageSize else { throw AgentDocumentError.invalid("page") }
-        var cursor = parent.range.lowerBound + 1
-        let endToken: UInt8 = parent.type == .object ? 125 : 93
-        var childNumber = 0
-        var entries: [JSONEntry] = []
-        let first = number * pageSize
-        while cursor < parent.range.upperBound {
-            try Task.checkCancellation()
-            try Self.skipWhitespace(data, &cursor)
-            guard cursor < data.count else { throw ReaderError.invalidJSON }
-            if data[cursor] == endToken { return JSONPage(entries: entries, hasMore: false) }
-            var label = "[\(childNumber)]"
-            if parent.type == .object {
-                guard data[cursor] == 34 else { throw ReaderError.invalidJSON }
-                let keyStart = cursor
-                try skipString(&cursor)
-                let keyData = data[keyStart..<cursor]
+        return try data.withUnsafeBytes { rawBuffer -> JSONPage in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            var cursor = parent.range.lowerBound + 1
+            let endToken: UInt8 = parent.type == .object ? 125 : 93
+            var childNumber = 0
+            var entries: [JSONEntry] = []
+            let first = number * pageSize
+            while cursor < parent.range.upperBound {
+                try Task.checkCancellation()
+                try Self.skipWhitespace(bytes, &cursor)
+                guard cursor < bytes.count else { throw ReaderError.invalidJSON }
+                if bytes[cursor] == endToken { return JSONPage(entries: entries, hasMore: false) }
+                var label = "[\(childNumber)]"
+                if parent.type == .object {
+                    guard bytes[cursor] == 34 else { throw ReaderError.invalidJSON }
+                    let keyStart = cursor
+                    try Self.skipString(bytes, &cursor)
+                    if childNumber >= first {
+                        let keyData = data[keyStart..<cursor]
+                        guard let key = try JSONSerialization.jsonObject(with: Data(keyData), options: .fragmentsAllowed) as? String else { throw ReaderError.invalidJSON }
+                        label = key
+                    }
+                    try Self.skipWhitespace(bytes, &cursor)
+                    guard cursor < bytes.count, bytes[cursor] == 58 else { throw ReaderError.invalidJSON }
+                    cursor += 1
+                    try Self.skipWhitespace(bytes, &cursor)
+                }
+                let start = cursor
+                let type = Self.kind(bytes[cursor])
+                try Self.skipValue(bytes, &cursor)
                 if childNumber >= first {
-                    guard let key = try JSONSerialization.jsonObject(with: Data(keyData), options: .fragmentsAllowed) as? String else { throw ReaderError.invalidJSON }
-                    label = key
+                    let summary: String
+                    switch type {
+                    case .object: summary = "{…}"
+                    case .array: summary = "[…]"
+                    case .scalar:
+                        let prefix = data[start..<min(cursor, start + 120)]
+                        summary = String(decoding: prefix, as: UTF8.self) + (cursor - start > 120 ? "…" : "")
+                    }
+                    entries.append(JSONEntry(label: label, range: start..<cursor, type: type, summary: summary))
+                    if entries.count > pageSize { return JSONPage(entries: Array(entries.prefix(pageSize)), hasMore: true) }
                 }
-                try Self.skipWhitespace(data, &cursor)
-                guard cursor < data.count, data[cursor] == 58 else { throw ReaderError.invalidJSON }
-                cursor += 1
-                try Self.skipWhitespace(data, &cursor)
+                childNumber += 1
+                try Self.skipWhitespace(bytes, &cursor)
+                guard cursor < bytes.count else { throw ReaderError.invalidJSON }
+                if bytes[cursor] == 44 { cursor += 1; continue }
+                if bytes[cursor] == endToken { return JSONPage(entries: entries, hasMore: false) }
+                throw ReaderError.invalidJSON
             }
-            let start = cursor
-            let type = Self.kind(data[cursor])
-            try skipValue(&cursor)
-            if childNumber >= first {
-                let summary: String
-                switch type {
-                case .object: summary = "{…}"
-                case .array: summary = "[…]"
-                case .scalar:
-                    let prefix = data[start..<min(cursor, start + 120)]
-                    summary = String(decoding: prefix, as: UTF8.self) + (cursor - start > 120 ? "…" : "")
-                }
-                entries.append(JSONEntry(label: label, range: start..<cursor, type: type, summary: summary))
-                if entries.count > pageSize { return JSONPage(entries: Array(entries.prefix(pageSize)), hasMore: true) }
-            }
-            childNumber += 1
-            try Self.skipWhitespace(data, &cursor)
-            guard cursor < data.count else { throw ReaderError.invalidJSON }
-            if data[cursor] == 44 { cursor += 1; continue }
-            if data[cursor] == endToken { return JSONPage(entries: entries, hasMore: false) }
             throw ReaderError.invalidJSON
         }
-        throw ReaderError.invalidJSON
     }
 
     private static func kind(_ byte: UInt8) -> JSONValueType {
@@ -144,28 +147,34 @@ final class JSONIndex: @unchecked Sendable {
     private static func skipWhitespace(_ data: Data, _ cursor: inout Int) throws {
         while cursor < data.count && (data[cursor] == 32 || data[cursor] == 10 || data[cursor] == 13 || data[cursor] == 9) { cursor += 1 }
     }
-    private func skipString(_ cursor: inout Int) throws {
-        guard cursor < data.count, data[cursor] == 34 else { throw ReaderError.invalidJSON }
+    private static func skipWhitespace(_ bytes: UnsafeBufferPointer<UInt8>, _ cursor: inout Int) throws {
+        while cursor < bytes.count && (bytes[cursor] == 32 || bytes[cursor] == 10 || bytes[cursor] == 13 || bytes[cursor] == 9) {
+            if cursor & 0xFFF == 0 { try Task.checkCancellation() }
+            cursor += 1
+        }
+    }
+    private static func skipString(_ bytes: UnsafeBufferPointer<UInt8>, _ cursor: inout Int) throws {
+        guard cursor < bytes.count, bytes[cursor] == 34 else { throw ReaderError.invalidJSON }
         cursor += 1
-        while cursor < data.count {
-            try Task.checkCancellation()
-            if data[cursor] == 92 { cursor += 2; continue }
-            if data[cursor] == 34 { cursor += 1; return }
+        while cursor < bytes.count {
+            if cursor & 0xFFF == 0 { try Task.checkCancellation() }
+            if bytes[cursor] == 92 { cursor += 2; continue }
+            if bytes[cursor] == 34 { cursor += 1; return }
             cursor += 1
         }
         throw ReaderError.invalidJSON
     }
-    private func skipValue(_ cursor: inout Int) throws {
-        guard cursor < data.count else { throw ReaderError.invalidJSON }
-        let first = data[cursor]
-        if first == 34 { try skipString(&cursor); return }
+    private static func skipValue(_ bytes: UnsafeBufferPointer<UInt8>, _ cursor: inout Int) throws {
+        guard cursor < bytes.count else { throw ReaderError.invalidJSON }
+        let first = bytes[cursor]
+        if first == 34 { try skipString(bytes, &cursor); return }
         if first == 123 || first == 91 {
             var stack: [UInt8] = [first == 123 ? 125 : 93]
             cursor += 1
-            while cursor < data.count {
-                try Task.checkCancellation()
-                let byte = data[cursor]
-                if byte == 34 { try skipString(&cursor); continue }
+            while cursor < bytes.count {
+                if cursor & 0xFFF == 0 { try Task.checkCancellation() }
+                let byte = bytes[cursor]
+                if byte == 34 { try skipString(bytes, &cursor); continue }
                 if byte == 123 { stack.append(125) }
                 if byte == 91 { stack.append(93) }
                 if byte == 125 || byte == 93 {
@@ -178,9 +187,9 @@ final class JSONIndex: @unchecked Sendable {
             }
             throw ReaderError.invalidJSON
         }
-        while cursor < data.count {
-            try Task.checkCancellation()
-            let byte = data[cursor]
+        while cursor < bytes.count {
+            if cursor & 0xFFF == 0 { try Task.checkCancellation() }
+            let byte = bytes[cursor]
             if byte == 44 || byte == 125 || byte == 93 || byte == 32 || byte == 10 || byte == 13 || byte == 9 { return }
             cursor += 1
         }

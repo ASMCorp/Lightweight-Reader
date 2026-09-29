@@ -1,9 +1,9 @@
 import AppKit
 import WebKit
 
-struct MarkdownHTML {
+struct MarkdownHTML: Sendable {
     let baseURL: URL
-    func render(_ markdown: String) -> String {
+    func render(_ markdown: String) throws -> String {
         let lines = markdown.components(separatedBy: .newlines)
         var output = ""
         var index = 0
@@ -11,6 +11,7 @@ struct MarkdownHTML {
         var codeLanguage = ""
         var inList = false
         while index < lines.count {
+            try Task.checkCancellation()
             let line = lines[index]
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") {
@@ -26,6 +27,7 @@ struct MarkdownHTML {
                 output += "<table><thead><tr>" + headers.map { "<th>\(inline($0))</th>" }.joined() + "</tr></thead><tbody>"
                 index += 2
                 while index < lines.count && lines[index].contains("|") && !lines[index].trimmingCharacters(in: .whitespaces).isEmpty {
+                    try Task.checkCancellation()
                     output += "<tr>" + cells(lines[index]).map { "<td>\(inline($0))</td>" }.joined() + "</tr>"
                     index += 1
                 }
@@ -120,9 +122,9 @@ final class MarkdownViewController: NSViewController, NSTextViewDelegate {
     private(set) var isDirty = false
     private var savedHash: String
     var onDirtyChange: ((Bool) -> Void)?
-    init(url: URL, text: String, store: MarkdownStore = MarkdownStore()) {
+    init(url: URL, text: String, savedHash: String, store: MarkdownStore = MarkdownStore()) {
         self.url = url; self.store = store
-        savedHash = store.hash(text)
+        self.savedHash = savedHash
         super.init(nibName: nil, bundle: nil)
         editor.string = text
     }
@@ -184,7 +186,7 @@ final class MarkdownViewController: NSViewController, NSTextViewDelegate {
             footer.heightAnchor.constraint(greaterThanOrEqualToConstant: 28)
         ])
         view = container
-        renderPreview()
+        schedulePreview()
     }
     @objc private func changeMarkdownMode() {
         let showPreviewOnly = modeControl.selectedSegment == 1
@@ -209,16 +211,36 @@ final class MarkdownViewController: NSViewController, NSTextViewDelegate {
     func textDidChange(_ notification: Notification) {
         isDirty = true
         onDirtyChange?(true)
-        previewTask?.cancel()
-        previewTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled else { return }
-            self?.renderPreview()
-        }
+        schedulePreview(delay: .milliseconds(250))
     }
-    private func renderPreview() {
-        let html = MarkdownHTML(baseURL: url.deletingLastPathComponent()).render(editor.string)
-        preview.loadHTMLString(html, baseURL: url.deletingLastPathComponent())
+    func cancelPreview() {
+        previewTask?.cancel()
+        previewTask = nil
+    }
+    private func schedulePreview(delay: Duration? = nil) {
+        cancelPreview()
+        previewTask = Task { [weak self] in
+            do {
+                if let delay { try await Task.sleep(for: delay) }
+                guard let self else { return }
+                let markdown = self.editor.string
+                let renderer = MarkdownHTML(baseURL: self.url.deletingLastPathComponent())
+                let rendering = Task.detached(priority: .userInitiated) {
+                    try renderer.render(markdown)
+                }
+                let html = try await withTaskCancellationHandler {
+                    try await rendering.value
+                } onCancel: {
+                    rendering.cancel()
+                }
+                guard !Task.isCancelled else { return }
+                self.preview.loadHTMLString(html, baseURL: self.url.deletingLastPathComponent())
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.status.stringValue = error.localizedDescription
+            }
+        }
     }
     func save() throws {
         try store.save(editor.string, to: url, expectedSha256: savedHash)

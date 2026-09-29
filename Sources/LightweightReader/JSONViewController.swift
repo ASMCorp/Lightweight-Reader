@@ -206,6 +206,8 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
         node.children = [TreeNode(.loading, parent: node)]
         node.loaded = true
         outline.reloadItem(node, reloadChildren: true)
+        outline.expandItem(node)
+        status.stringValue = String(localized: "json.loading")
         retainedPages.removeAll { $0 === node }
         retainedPages.append(node)
         while retainedPages.count > 8 {
