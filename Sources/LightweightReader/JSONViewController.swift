@@ -1,14 +1,17 @@
 import AppKit
 
-private final class TreeNode: @unchecked Sendable {
-    enum Role { case value(JSONEntry), next, previous, loading }
+@MainActor
+private final class TreeNode {
+    enum Role { case value(JSONEntry), next, previous, loading, error(String) }
     let role: Role
     weak var parent: TreeNode?
     var children: [TreeNode] = []
     var page = 0
     var loaded = false
+    var requestID = 0
     var task: Task<Void, Never>?
     init(_ role: Role, parent: TreeNode? = nil) { self.role = role; self.parent = parent }
+    deinit { task?.cancel() }
     var entry: JSONEntry? { if case .value(let entry) = role { return entry }; return nil }
     var pointer: String {
         guard let parent, let entry else { return "" }
@@ -20,9 +23,17 @@ private final class TreeNode: @unchecked Sendable {
         }
         return parent.pointer + "/" + component
     }
-    func cancelRecursively() {
+    func cancelTasksRecursively() {
+        requestID &+= 1
         task?.cancel()
-        for child in children { child.cancelRecursively() }
+        task = nil
+        for child in children { child.cancelTasksRecursively() }
+    }
+    func clearRecursively() {
+        requestID &+= 1
+        task?.cancel()
+        task = nil
+        for child in children { child.clearRecursively() }
         children.removeAll()
         loaded = false
     }
@@ -35,14 +46,13 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
     private let outline = NSOutlineView()
     private let status = NSTextField(labelWithString: "")
     private var retainedPages: [TreeNode] = []
+    private var startedRootLoad = false
     init(index: JSONIndex) {
         self.index = index
         root = TreeNode(.value(index.root))
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { return nil }
-    deinit { root.cancelRecursively() }
-
     override func loadView() {
         let container = NSView()
         let scroll = NSScrollView()
@@ -71,7 +81,16 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
             status.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8), status.heightAnchor.constraint(equalToConstant: 20)
         ])
         view = container
-        load(root, page: 0)
+    }
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        startRootLoadIfNeeded()
+    }
+    private func startRootLoadIfNeeded() {
+        guard !startedRootLoad else { return }
+        startedRootLoad = true
+        outline.reloadData()
+        load(root, page: 0, duringExpansion: false)
     }
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         if let node = item as? TreeNode { return node.children.count }
@@ -87,13 +106,19 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
     }
     func outlineViewItemWillExpand(_ notification: Notification) {
         guard let node = notification.userInfo?["NSObject"] as? TreeNode, !node.loaded else { return }
-        load(node, page: 0)
+        // AppKit is already expanding this item, so only prepare its child model here.
+        load(node, page: 0, duringExpansion: true)
     }
     func outlineViewItemDidCollapse(_ notification: Notification) {
         guard let node = notification.userInfo?["NSObject"] as? TreeNode else { return }
-        node.cancelRecursively()
-        retainedPages.removeAll { $0 === node }
-        outline.reloadItem(node, reloadChildren: true)
+        node.cancelTasksRecursively()
+        node.loaded = false
+        retainedPages.removeAll { $0 === node || isAncestor(node, of: $0) }
+        // Keep the old children alive until AppKit finishes the collapse callback.
+        Task { [weak self, weak node] in
+            guard let self, let node, !self.outline.isItemExpanded(node), !node.loaded else { return }
+            node.clearRecursively()
+        }
     }
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let node = item as? TreeNode else { return nil }
@@ -116,6 +141,7 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
         case .next: label.stringValue = String(localized: "json.next")
         case .previous: label.stringValue = String(localized: "json.previous")
         case .loading: label.stringValue = String(localized: "json.loading")
+        case .error(let message): label.stringValue = message
         }
         cell.addSubview(label)
         NSLayoutConstraint.activate([label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4), label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4), label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
@@ -125,10 +151,20 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
         let row = outline.selectedRow
         guard row >= 0, let node = outline.item(atRow: row) as? TreeNode, let parent = node.parent else { return }
         switch node.role {
-        case .next: load(parent, page: parent.page + 1)
-        case .previous: load(parent, page: max(0, parent.page - 1))
+        case .next:
+            Task { [weak self, weak parent] in
+                guard let self, let parent, self.outline.isItemExpanded(parent) else { return }
+                self.outline.deselectAll(nil)
+                self.load(parent, page: parent.page + 1, duringExpansion: false)
+            }
+        case .previous:
+            Task { [weak self, weak parent] in
+                guard let self, let parent, self.outline.isItemExpanded(parent) else { return }
+                self.outline.deselectAll(nil)
+                self.load(parent, page: max(0, parent.page - 1), duringExpansion: false)
+            }
         case .value: status.stringValue = node.pointer.isEmpty ? "/" : node.pointer
-        case .loading: break
+        case .loading, .error: break
         }
     }
     var selectionInfo: [String: Any] {
@@ -139,6 +175,7 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
     }
     func goToPointer(_ pointer: String) async throws {
         _ = view
+        startRootLoadIfNeeded()
         guard pointer.isEmpty || pointer.hasPrefix("/") else { throw AgentDocumentError.invalid("JSON pointer") }
         var node = root
         if !pointer.isEmpty {
@@ -146,7 +183,8 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
                 let component = String(raw).replacingOccurrences(of: "~1", with: "/").replacingOccurrences(of: "~0", with: "~")
                 guard let parentEntry = node.entry, parentEntry.type != .scalar else { throw AgentDocumentError.notFound }
                 let index = index
-                let (pageData, pageNumber, childIndex) = try await Task.detached(priority: .userInitiated) {
+                let requestID = node.requestID
+                let search = Task.detached(priority: .userInitiated) {
                     var pageNumber = 0
                     while true {
                         try Task.checkCancellation()
@@ -157,29 +195,18 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
                         guard pageData.hasMore else { throw AgentDocumentError.notFound }
                         pageNumber += 1
                     }
-                }.value
-                node.task?.cancel()
-                node.children = pageData.entries.map { TreeNode(.value($0), parent: node) }
-                if pageNumber > 0 { node.children.insert(TreeNode(.previous, parent: node), at: 0) }
-                if pageData.hasMore { node.children.append(TreeNode(.next, parent: node)) }
-                node.page = pageNumber
-                node.loaded = true
-                outline.reloadItem(node, reloadChildren: true)
-                outline.expandItem(node)
-                let next = node.children[childIndex + (pageNumber > 0 ? 1 : 0)]
-                retainedPages.removeAll { $0 === node }
-                retainedPages.append(node)
-                while retainedPages.count > 8 {
-                    let oldest = retainedPages.removeFirst()
-                    if let pathChild = oldest.children.first(where: { isAncestor($0, of: next) }) {
-                        oldest.children = [pathChild]
-                        outline.reloadItem(oldest, reloadChildren: true)
-                        outline.expandItem(oldest)
-                    } else {
-                        outline.collapseItem(oldest)
-                        oldest.cancelRecursively()
-                    }
                 }
+                let (pageData, pageNumber, childIndex) = try await withTaskCancellationHandler {
+                    try await search.value
+                } onCancel: {
+                    search.cancel()
+                }
+                try Task.checkCancellation()
+                guard node.requestID == requestID else { throw CancellationError() }
+                node.cancelTasksRecursively()
+                install(pageData, on: node, page: pageNumber)
+                let next = node.children[childIndex + (pageNumber > 0 ? 1 : 0)]
+                retainPage(node, protecting: next)
                 node = next
             }
         }
@@ -200,20 +227,22 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
         }
         return false
     }
-    private func load(_ node: TreeNode, page: Int) {
+    private func load(_ node: TreeNode, page: Int, duringExpansion: Bool) {
         guard let entry = node.entry else { return }
         node.task?.cancel()
+        node.requestID &+= 1
+        let requestID = node.requestID
+        let oldChildren = node.children
         node.children = [TreeNode(.loading, parent: node)]
         node.loaded = true
-        outline.reloadItem(node, reloadChildren: true)
-        outline.expandItem(node)
-        status.stringValue = String(localized: "json.loading")
-        retainedPages.removeAll { $0 === node }
-        retainedPages.append(node)
-        while retainedPages.count > 8 {
-            let oldest = retainedPages.removeFirst()
-            if oldest !== node { outline.collapseItem(oldest); oldest.cancelRecursively() }
+        if !duringExpansion {
+            if outline.isItemExpanded(node) {
+                outline.reloadItem(node, reloadChildren: true)
+            } else {
+                outline.expandItem(node)
+            }
         }
+        Task { oldChildren.forEach { $0.clearRecursively() } }
         let index = index
         node.task = Task { [weak self, weak node] in
             let scan = Task.detached(priority: .userInitiated) { try index.page(for: entry, number: page) }
@@ -223,16 +252,49 @@ final class JSONViewController: NSViewController, NSOutlineViewDataSource, NSOut
                 } onCancel: {
                     scan.cancel()
                 }
-                guard !Task.isCancelled, let self, let node else { return }
-                node.children = result.entries.map { TreeNode(.value($0), parent: node) }
-                if page > 0 { node.children.insert(TreeNode(.previous, parent: node), at: 0) }
-                if result.hasMore { node.children.append(TreeNode(.next, parent: node)) }
-                node.page = page
+                guard !Task.isCancelled, let self, let node,
+                      node.requestID == requestID, self.outline.isItemExpanded(node) else { return }
+                self.install(result, on: node, page: page)
                 self.status.stringValue = String(format: String(localized: "json.page"), page + 1)
-                self.outline.reloadItem(node, reloadChildren: true)
-                self.outline.expandItem(node)
+                self.retainPage(node, protecting: node)
             } catch is CancellationError { } catch {
-                self?.status.stringValue = error.localizedDescription
+                guard !Task.isCancelled, let self, let node,
+                      node.requestID == requestID, self.outline.isItemExpanded(node) else { return }
+                let oldChildren = node.children
+                node.children = [TreeNode(.error(error.localizedDescription), parent: node)]
+                self.outline.reloadItem(node, reloadChildren: true)
+                oldChildren.forEach { $0.clearRecursively() }
+                self.status.stringValue = error.localizedDescription
+            }
+        }
+    }
+    private func install(_ pageData: JSONPage, on node: TreeNode, page: Int) {
+        let oldChildren = node.children
+        node.children = pageData.entries.map { TreeNode(.value($0), parent: node) }
+        if page > 0 { node.children.insert(TreeNode(.previous, parent: node), at: 0) }
+        if pageData.hasMore { node.children.append(TreeNode(.next, parent: node)) }
+        node.page = page
+        node.loaded = true
+        if outline.isItemExpanded(node) {
+            outline.reloadItem(node, reloadChildren: true)
+        } else {
+            outline.expandItem(node)
+        }
+        oldChildren.forEach { $0.clearRecursively() }
+    }
+    private func retainPage(_ node: TreeNode, protecting activeNode: TreeNode) {
+        guard node !== root else { return }
+        retainedPages.removeAll { $0 === node }
+        retainedPages.append(node)
+        while retainedPages.count > 8 {
+            guard let index = retainedPages.firstIndex(where: {
+                $0 !== activeNode && !isAncestor($0, of: activeNode)
+            }) else { break }
+            let oldest = retainedPages.remove(at: index)
+            if outline.isItemExpanded(oldest) {
+                outline.collapseItem(oldest)
+            } else {
+                oldest.clearRecursively()
             }
         }
     }
